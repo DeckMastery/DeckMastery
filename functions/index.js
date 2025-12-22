@@ -1,269 +1,491 @@
-import { initializeApp } from "firebase-admin/app";
-import { getFirestore, FieldValue, Timestamp } from "firebase-admin/firestore";
-import { onCall, HttpsError } from "firebase-functions/v2/https";
-import { setGlobalOptions } from "firebase-functions/v2";
+const admin = require("firebase-admin");
+const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
 
-initializeApp();
-const db = getFirestore();
+admin.initializeApp();
+const db = admin.firestore();
 
-setGlobalOptions({ region: "europe-west1" });
+const REGION = "europe-west3";
+const TZ = "Europe/Berlin";
 
-function requireAuth(ctx) {
-  if (!ctx.auth?.uid) throw new HttpsError("unauthenticated", "غير مصرح.");
-  return ctx.auth.uid;
+/** أدوات وقت السيرفر */
+function nowTs() {
+  return admin.firestore.Timestamp.now();
 }
 
-function normalizeUsername(u) {
-  return String(u || "").trim();
-}
-function usernameKey(u) {
-  return normalizeUsername(u).toLowerCase();
-}
-function validateUsername(u) {
-  const s = normalizeUsername(u);
-  if (s.length < 3 || s.length > 30) return false;
-  if (!/^[A-Za-z0-9_]+$/.test(s)) return false;
-  return true;
-}
-
-function assetsDefaultsByGender(gender) {
-  if (gender === "female") {
-    return { frameKey: "woodDefault", backgroundKey: "femaleDefault", avatarKey: "femaleDefault" };
-  }
-  if (gender === "male") {
-    return { frameKey: "woodDefault", backgroundKey: "maleDefault", avatarKey: "maleDefault" };
-  }
-  return { frameKey: "woodDefault", backgroundKey: "otherDefault", avatarKey: "otherDefault" };
+function datePartsInTZ(ts) {
+  const d = ts.toDate();
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TZ,
+    year: "2-digit",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = fmt.formatToParts(d).reduce((acc, p) => {
+    if (p.type !== "literal") acc[p.type] = p.value;
+    return acc;
+  }, {});
+  // day/month/year (2-digit)
+  return { dd: parts.day, mm: parts.month, yy: parts.year };
 }
 
-async function ensureSeasonDoc() {
-  const ref = db.collection("meta").doc("season");
+function dailyGroupName(ts) {
+  const { dd, mm, yy } = datePartsInTZ(ts);
+  return `${dd}.${mm}.${yy}`;
+}
+
+// groupId ثابت وآمن للفرز
+function dailyGroupId(ts) {
+  const { dd, mm, yy } = datePartsInTZ(ts);
+  return `${yy}${mm}${dd}`; // YYMMDD
+}
+
+function requireAuth(req) {
+  if (!req.auth) throw new HttpsError("unauthenticated", "Unauthenticated");
+  return req.auth.uid;
+}
+
+/** التحقق من أطوال البطاقة */
+function validateCard({ original, translation, hint }) {
+  if (typeof original !== "string" || typeof translation !== "string" || typeof hint !== "string")
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  if (original.length === 0 || translation.length === 0 || hint.length === 0)
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  if (original.length > 45 || translation.length > 45 || hint.length > 60)
+    throw new HttpsError("invalid-argument", "Invalid");
+}
+
+/** تهيئة وثيقة المستخدم عند أول دخول (Server-side truth) */
+async function ensureUserDoc(uid, email) {
+  const ref = db.doc(`users/${uid}`);
   const snap = await ref.get();
   if (snap.exists) return snap.data();
 
-  const now = Timestamp.now();
-  const endsAt = Timestamp.fromMillis(now.toMillis() + 100 * 24 * 60 * 60 * 1000);
+  const ts = nowTs();
 
-  const season = {
-    startedAt: now,
-    endsAt,
-    lengthDays: 100,
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp()
-  };
+  const data = {
+    uid,
+    email: email || null,
+    createdAt: ts,
+    lastSeenAt: ts,
 
-  await ref.set(season, { merge: true });
-  return season;
-}
-
-async function ensureUserDoc(uid) {
-  const ref = db.collection("users").doc(uid);
-  const snap = await ref.get();
-  if (snap.exists) return snap.data();
-
-  const defaults = {
-    username: null,
-    gender: null,
-    profileComplete: false,
-    emailVerified: false,
-
-    level: 1,
-    xp: 0,
     gold: 0,
+    xp: 0,
+    level: 1,
+
     ratingPoints: 0,
-    ratingTier: "Wood",
-    ratingSublevel: 1,
+    rankTier: "wood",
+    rankLevel: 1,
+
+    seasonId: 1,
+    seasonStartAt: ts,
 
     streakCurrent: 0,
+    fuel: 0,
 
-    frameKey: "woodDefault",
-    backgroundKey: "otherDefault",
-    avatarKey: "otherDefault",
+    username: null,
+    gender: null,
+    avatarKey: null,
+    bgKey: null,
+    frameKey: "frame_default",
 
-    createdAt: FieldValue.serverTimestamp(),
-    updatedAt: FieldValue.serverTimestamp(),
-    lastSeenAt: FieldValue.serverTimestamp()
+    profileComplete: false,
   };
 
-  await ref.set(defaults, { merge: true });
-  return defaults;
+  await ref.set(data);
+  return data;
 }
 
-export const user_getMe = onCall(async (req) => {
-  const uid = requireAuth(req);
-  const [user, season] = await Promise.all([
-    ensureUserDoc(uid),
-    ensureSeasonDoc()
-  ]);
+/** config/global للموسم */
+async function ensureGlobalConfig() {
+  const ref = db.doc("config/global");
+  const snap = await ref.get();
+  const ts = nowTs();
+  if (!snap.exists) {
+    await ref.set({
+      seasonId: 1,
+      seasonStartAt: ts,
+      lastResetAt: null,
+    });
+    return { seasonId: 1, seasonStartAt: ts, lastResetAt: null };
+  }
+  return snap.data();
+}
 
-  return {
-    serverTime: Timestamp.now().toDate().toISOString(),
-    seasonEndsAt: season?.endsAt?.toDate?.().toISOString?.() ?? null,
-    user
+/** Username uniqueness عبر collection usernames */
+async function claimUsername(uid, username) {
+  // docId = username lowercase لضمان uniqueness
+  const docId = username.toLowerCase();
+  const ref = db.doc(`usernames/${docId}`);
+
+  await db.runTransaction(async (tx) => {
+    const s = await tx.get(ref);
+    if (s.exists) throw new HttpsError("already-exists", "USERNAME_TAKEN");
+    tx.set(ref, { username, uid, createdAt: nowTs() });
+  });
+}
+
+/** تصنيف label */
+function rankLabel(tier, level) {
+  const map = {
+    wood: "خشبي",
+    iron: "حديدي",
+    bronze: "نحاسي",
+    silver: "فضي",
+    gold: "ذهبي",
+    emerald: "زمردي",
+    platinum: "بلاتيني",
+    diamond: "ألماسي",
+    master: "أستاذ",
+    thinker: "مفكر",
+    sage: "حكيم",
+    inspirer: "ملهم",
   };
-});
+  return `${map[tier] || "خشبي"} ${level || 1}`;
+}
 
-export const user_touchLastSeen = onCall(async (req) => {
+/** خوارزمية Season Reset (حسب وثيقتك) */
+function computeResetTarget(rankTier) {
+  // الفئة الذهبية: (ملهم، حكيم، مفكر) => بلاتيني 1
+  if (["inspirer", "sage", "thinker"].includes(rankTier)) {
+    return { rankTier: "platinum", rankLevel: 1, ratingPoints: 0 };
+  }
+  // الفئة الفضية: (أستاذ، ألماسي، بلاتيني) => زمردي 1
+  if (["master", "diamond", "platinum"].includes(rankTier)) {
+    return { rankTier: "emerald", rankLevel: 1, ratingPoints: 0 };
+  }
+  // الفئة النحاسية: (زمردي) => ذهبي 1
+  if (["emerald"].includes(rankTier)) {
+    return { rankTier: "gold", rankLevel: 1, ratingPoints: 0 };
+  }
+  // التأسيسية: (فضي، نحاسي، حديدي، خشبي) => نفس tier لكن level 1
+  if (["silver", "bronze", "iron", "wood"].includes(rankTier)) {
+    return { rankTier, rankLevel: 1, ratingPoints: 0 };
+  }
+  return { rankTier: "wood", rankLevel: 1, ratingPoints: 0 };
+}
+
+/** 1) إكمال البيانات (Username فريد + Gender ثابت) */
+exports.completeProfile = onCall({ region: REGION }, async (req) => {
   const uid = requireAuth(req);
-  const ref = db.collection("users").doc(uid);
-  await ref.set(
-    { lastSeenAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() },
-    { merge: true }
-  );
+  const { username, gender } = req.data || {};
+
+  if (typeof username !== "string" || username.length < 3 || username.length > 30)
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  if (!/^[A-Za-z0-9_]+$/.test(username))
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  if (!["male", "female", "other"].includes(gender))
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  const userRecord = await admin.auth().getUser(uid);
+  const profile = await ensureUserDoc(uid, userRecord.email);
+
+  if (profile.profileComplete === true)
+    throw new HttpsError("failed-precondition", "ALREADY_COMPLETE");
+
+  await claimUsername(uid, username);
+
+  const defaultBgKey =
+    gender === "female" ? "bg_female_01" :
+    gender === "male" ? "bg_male_01" : "bg_other_01";
+
+  const defaultAvatarKey =
+    gender === "female" ? "av_female_01" :
+    gender === "male" ? "av_male_01" : "av_other_01";
+
+  await db.doc(`users/${uid}`).update({
+    username,
+    gender,
+    bgKey: defaultBgKey,
+    avatarKey: defaultAvatarKey,
+    profileComplete: true,
+    lastSeenAt: nowTs(),
+  });
+
   return { ok: true };
 });
 
-export const username_check = onCall(async (req) => {
-  const username = normalizeUsername(req.data?.username);
-  if (!validateUsername(username)) return { available: false };
-
-  const key = usernameKey(username);
-  const ref = db.collection("usernames").doc(key);
-  const snap = await ref.get();
-  return { available: !snap.exists };
-});
-
-export const user_completeProfile = onCall(async (req) => {
+/** 2) إنشاء بطاقة (Server Timestamp + Daily Group server time) */
+exports.createCard = onCall({ region: REGION }, async (req) => {
   const uid = requireAuth(req);
+  const { original, translation, hint } = req.data || {};
+  validateCard({ original, translation, hint });
 
-  const username = normalizeUsername(req.data?.username);
-  const gender = req.data?.gender;
+  const userRecord = await admin.auth().getUser(uid);
+  await ensureUserDoc(uid, userRecord.email);
 
-  if (!validateUsername(username)) {
-    throw new HttpsError("invalid-argument", "اسم المستخدم غير صالح.");
-  }
-  if (!["male", "female", "other"].includes(gender)) {
-    throw new HttpsError("invalid-argument", "الجنس غير صالح.");
-  }
+  const ts = nowTs();
+  const groupId = dailyGroupId(ts);
+  const groupName = dailyGroupName(ts);
 
-  const userRef = db.collection("users").doc(uid);
-  const unameKey = usernameKey(username);
-  const unameRef = db.collection("usernames").doc(unameKey);
+  const cardsCol = db.collection(`users/${uid}/cards`);
+  const cardRef = cardsCol.doc();
 
-  const assets = assetsDefaultsByGender(gender);
+  const groupRef = db.doc(`users/${uid}/dailyGroups/${groupId}`);
 
   await db.runTransaction(async (tx) => {
-    const [userSnap, unameSnap] = await Promise.all([
-      tx.get(userRef),
-      tx.get(unameRef)
-    ]);
-
-    const existingUser = userSnap.exists ? userSnap.data() : null;
-
-    if (existingUser?.profileComplete === true) {
-      throw new HttpsError("failed-precondition", "تم تثبيت البيانات مسبقًا.");
-    }
-    if (existingUser?.username && existingUser.username !== username) {
-      throw new HttpsError("failed-precondition", "تم تثبيت اسم المستخدم مسبقًا.");
-    }
-    if (existingUser?.gender && existingUser.gender !== gender) {
-      throw new HttpsError("failed-precondition", "تم تثبيت الجنس مسبقًا.");
+    const g = await tx.get(groupRef);
+    if (!g.exists) {
+      tx.set(groupRef, {
+        id: groupId,
+        name: groupName,
+        createdAt: ts,
+      });
     }
 
-    if (unameSnap.exists) {
-      const owner = unameSnap.data()?.uid;
-      if (owner && owner !== uid) {
-        throw new HttpsError("already-exists", "اسم المستخدم غير متاح.");
-      }
-    }
+    tx.set(cardRef, {
+      id: cardRef.id,
+      groupId,
+      createdAt: ts,
+      lastSeenAt: ts,
+      level: 0,
+      lastRating: null, // "easy" | "medium" | "hard"
+      ignored: false,
+      completed: false,
+      original,
+      translation,
+      hint,
+    });
+  });
 
-    tx.set(unameRef, {
-      uid,
-      username,
-      createdAt: FieldValue.serverTimestamp()
-    }, { merge: true });
+  return { ok: true, cardId: cardRef.id, groupId, groupName };
+});
 
-    if (!userSnap.exists) {
-      tx.set(userRef, {
-        username,
-        gender,
-        profileComplete: true,
-        ...assets,
-        level: 1,
-        xp: 0,
-        gold: 0,
-        ratingPoints: 0,
-        ratingTier: "Wood",
-        ratingSublevel: 1,
-        streakCurrent: 0,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        lastSeenAt: FieldValue.serverTimestamp()
-      }, { merge: true });
+/** 3) تطبيق المكافآت (Gold/XP/Rating) — فقط من السيرفر */
+exports.applyRewards = onCall({ region: REGION }, async (req) => {
+  const uid = requireAuth(req);
+
+  // هذا endpoint يستقبل نتيجة درس/لعبة محسوبة من العميل لاحقاً
+  // ولكن منع الغش الحقيقي يتطلب أن الحساب يتم في السيرفر وفق قواعدك.
+  // حالياً: نطبّق قيماً مُرسلة ضمن حدود صارمة.
+  const { xpDelta, goldDelta, ratingDelta } = req.data || {};
+
+  const dxp = Number(xpDelta || 0);
+  const dgold = Number(goldDelta || 0);
+  const drating = Number(ratingDelta || 0);
+
+  if (!Number.isFinite(dxp) || !Number.isFinite(dgold) || !Number.isFinite(drating))
+    throw new HttpsError("invalid-argument", "Invalid");
+
+  // حدود أمان أولية
+  if (dxp < -5000 || dxp > 5000) throw new HttpsError("invalid-argument", "Invalid");
+  if (dgold < -500 || dgold > 500) throw new HttpsError("invalid-argument", "Invalid");
+  if (drating < -5000 || drating > 5000) throw new HttpsError("invalid-argument", "Invalid");
+
+  const ref = db.doc(`users/${uid}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("failed-precondition", "NO_PROFILE");
+
+  const u = snap.data();
+
+  const newXp = Math.max(0, (u.xp || 0) + dxp);
+  const newGold = Math.max(0, (u.gold || 0) + dgold);
+  const newRating = Math.max(0, (u.ratingPoints || 0) + drating);
+
+  // level بسيط: كل 1000 XP مستوى (قابل للتعديل لاحقاً)
+  const newLevel = Math.max(1, Math.floor(newXp / 1000) + 1);
+
+  await ref.update({
+    xp: newXp,
+    gold: newGold,
+    ratingPoints: newRating,
+    level: newLevel,
+    lastSeenAt: nowTs(),
+  });
+
+  return { ok: true, xp: newXp, gold: newGold, ratingPoints: newRating, level: newLevel };
+});
+
+/** 4) إنهاء درس وتسجيل حضور + Streak — وقت سيرفر */
+exports.finishLesson = onCall({ region: REGION }, async (req) => {
+  const uid = requireAuth(req);
+  const ref = db.doc(`users/${uid}`);
+  const snap = await ref.get();
+  if (!snap.exists) throw new HttpsError("failed-precondition", "NO_PROFILE");
+
+  const ts = nowTs();
+  const todayId = dailyGroupId(ts); // YYMMDD في توقيت برلين
+
+  // نخزن آخر يوم حضور كـ string (آمن للمقارنة اليومية)
+  // الحقول الحساسة لا يُسمح للعميل بكتابتها (rules تمنع)
+  await db.runTransaction(async (tx) => {
+    const s = await tx.get(ref);
+    const u = s.data() || {};
+    const lastAttendanceId = u.lastAttendanceId || null;
+
+    let streak = Number(u.streakCurrent || 0);
+
+    if (lastAttendanceId === todayId) {
+      // نفس اليوم: لا تغيير
     } else {
-      tx.set(userRef, {
-        username,
-        gender,
-        profileComplete: true,
-        ...assets,
-        updatedAt: FieldValue.serverTimestamp()
-      }, { merge: true });
+      // إذا كان آخر حضور أمس => streak +1
+      // إذا كان أقدم => streak = 1 (Start New Streak)
+      // المقارنة هنا على مستوى YYMMDD string، مع منطق "فرق يوم" عبر Date
+      streak = computeNewStreak(lastAttendanceId, todayId, streak);
+      tx.update(ref, {
+        streakCurrent: streak,
+        lastAttendanceId: todayId,
+        lastLessonFinishedAt: ts,
+        lastSeenAt: ts,
+      });
     }
   });
 
-  const fresh = await userRef.get();
-  return { ok: true, user: fresh.data() };
+  const after = (await ref.get()).data();
+  return { ok: true, streakCurrent: after.streakCurrent, lastAttendanceId: after.lastAttendanceId };
 });
 
-export const leaderboard_top100 = onCall(async (req) => {
-  requireAuth(req);
-  const season = await ensureSeasonDoc();
+function computeNewStreak(lastId, todayId, currentStreak) {
+  // lastId/todayId: YYMMDD
+  if (!lastId) return 1;
 
-  const snap = await db.collection("users")
+  const toDate = (id) => {
+    const yy = Number(id.slice(0,2));
+    const mm = Number(id.slice(2,4));
+    const dd = Number(id.slice(4,6));
+    // نفترض 20YY
+    return new Date(Date.UTC(2000 + yy, mm - 1, dd));
+  };
+
+  const last = toDate(lastId);
+  const today = toDate(todayId);
+  const diffDays = Math.round((today - last) / (1000*60*60*24));
+
+  if (diffDays === 1) return currentStreak + 1;
+  return 1;
+}
+
+/** 5) Leaderboard Top100 من السيرفر */
+exports.getTop100 = onCall({ region: REGION }, async (req) => {
+  requireAuth(req);
+
+  const q = await db.collection("users")
     .orderBy("ratingPoints", "desc")
     .limit(100)
     .get();
 
-  const users = snap.docs.map((d) => {
+  let place = 0;
+  const list = q.docs.map((d) => {
+    place += 1;
     const u = d.data();
     return {
-      uid: d.id,
-      username: u.username ?? null,
-      gender: u.gender ?? null,
-      level: u.level ?? 1,
-      ratingPoints: u.ratingPoints ?? 0,
-      frameKey: u.frameKey ?? "woodDefault",
-      backgroundKey: u.backgroundKey ?? "otherDefault",
-      avatarKey: u.avatarKey ?? "otherDefault",
-      ratingTier: u.ratingTier ?? "Wood",
-      ratingSublevel: u.ratingSublevel ?? 1
+      place,
+      uid: u.uid,
+      username: u.username,
+      gender: u.gender,
+      level: u.level || 1,
+      ratingPoints: u.ratingPoints || 0,
+      avatarKey: u.avatarKey,
+      frameKey: u.frameKey,
+      bgKey: u.bgKey,
+      rankTier: u.rankTier,
+      rankLevel: u.rankLevel,
+      rankLabel: rankLabel(u.rankTier, u.rankLevel),
     };
   });
 
-  return {
-    serverTime: Timestamp.now().toDate().toISOString(),
-    seasonEndsAt: season?.endsAt?.toDate?.().toISOString?.() ?? null,
-    users
-  };
+  return { list };
 });
 
-export const leaderboard_myRank = onCall(async (req) => {
+/** 6) Percentile للمستخدم (سيرفر) */
+exports.getMyPercentile = onCall({ region: REGION }, async (req) => {
   const uid = requireAuth(req);
-  const meSnap = await db.collection("users").doc(uid).get();
-  if (!meSnap.exists) throw new HttpsError("not-found", "المستخدم غير موجود.");
 
-  const my = meSnap.data();
-  const myRP = Number(my?.ratingPoints ?? 0);
+  const meSnap = await db.doc(`users/${uid}`).get();
+  if (!meSnap.exists) throw new HttpsError("failed-precondition", "NO_PROFILE");
+  const me = meSnap.data();
+  const myRating = Number(me.ratingPoints || 0);
 
-  const topSnap = await db.collection("users").orderBy("ratingPoints", "desc").limit(100).get();
-  let inTop100 = false;
-  let rank = null;
-  topSnap.docs.forEach((d, i) => {
-    if (d.id === uid) { inTop100 = true; rank = i + 1; }
-  });
-
+  // إجمالي المستخدمين
   const totalAgg = await db.collection("users").count().get();
   const total = totalAgg.data().count || 1;
 
-  if (inTop100) {
-    return { inTop100: true, rank, total, percent: Math.ceil((rank / total) * 100) };
-  }
-
-  const higherAgg = await db.collection("users").where("ratingPoints", ">", myRP).count().get();
+  // عدد أعلى منه
+  const higherAgg = await db.collection("users").where("ratingPoints", ">", myRating).count().get();
   const higher = higherAgg.data().count || 0;
 
-  const computedRank = higher + 1;
-  const percent = Math.ceil((computedRank / total) * 100);
-
-  return { inTop100: false, rank: computedRank, total, percent };
+  const percentile = Math.max(1, Math.round(((total - higher) / total) * 100));
+  return { percentile, total, higher };
 });
+
+/** 7) معلومات الموسم + عداد الأيام المتبقية */
+exports.getSeasonInfo = onCall({ region: REGION }, async (req) => {
+  requireAuth(req);
+  const cfg = await ensureGlobalConfig();
+
+  const now = nowTs();
+  const elapsedMs = now.toMillis() - cfg.seasonStartAt.toMillis();
+  const daysPassed = Math.floor(elapsedMs / (1000*60*60*24));
+  const daysLeft = Math.max(0, 100 - daysPassed);
+
+  return { seasonId: cfg.seasonId, daysLeft };
+});
+
+/** 8) Scheduled Season Reset — شيك يومي، يطبق عند مرور 100 يوم */
+exports.seasonResetJob = onSchedule(
+  { schedule: "15 3 * * *", timeZone: TZ, region: REGION },
+  async () => {
+    const cfgRef = db.doc("config/global");
+    const cfgSnap = await cfgRef.get();
+    const now = nowTs();
+
+    if (!cfgSnap.exists) {
+      await cfgRef.set({ seasonId: 1, seasonStartAt: now, lastResetAt: null });
+      return;
+    }
+
+    const cfg = cfgSnap.data();
+    const seasonStartAt = cfg.seasonStartAt || now;
+    const seasonId = cfg.seasonId || 1;
+
+    const elapsedMs = now.toMillis() - seasonStartAt.toMillis();
+    const days = Math.floor(elapsedMs / (1000*60*60*24));
+    if (days < 100) return;
+
+    const newSeasonId = seasonId + 1;
+    await cfgRef.update({
+      seasonId: newSeasonId,
+      seasonStartAt: now,
+      lastResetAt: now,
+    });
+
+    // Batch reset لجميع المستخدمين
+    const usersCol = db.collection("users");
+    const pageSize = 400;
+    let last = null;
+    let processed = 0;
+
+    while (true) {
+      let q = usersCol.orderBy("uid").limit(pageSize);
+      if (last) q = q.startAfter(last);
+
+      const snap = await q.get();
+      if (snap.empty) break;
+
+      const batch = db.batch();
+
+      snap.docs.forEach((docSnap) => {
+        const u = docSnap.data() || {};
+        const reset = computeResetTarget(u.rankTier || "wood");
+
+        batch.update(docSnap.ref, {
+          seasonId: newSeasonId,
+          ratingPoints: 0,
+          rankTier: reset.rankTier,
+          rankLevel: reset.rankLevel,
+          lastSeenAt: now,
+        });
+      });
+
+      await batch.commit();
+      processed += snap.size;
+      last = snap.docs[snap.docs.length - 1];
+    }
+
+    console.log(`Season reset done. Processed: ${processed}`);
+  }
+);
